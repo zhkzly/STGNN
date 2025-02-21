@@ -1,0 +1,359 @@
+
+
+
+import torch
+import numpy as np
+import torch.nn as nn
+from utils import generate_embedding_matrix, attention_with_dot_scale
+import math
+import torch.nn.functional as F
+
+
+class GCN(nn.Module):
+    '''this is used to calculate the gcn '''
+
+    def __init__(self, d: int, dtype=torch.float32):
+        super(GCN, self).__init__()
+        self.linear = nn.Linear(in_features=d, out_features=d, bias=False, dtype=dtype)
+        self.dtype = dtype
+
+    def forward(self, A, X):
+        '''
+        this is used to calculate the gcn
+        :param A:  tensor(N,N) calculated by adja matrix
+        :param X: tensor(b,T,N,d)
+        :return:output:tensor (b,T,N,d)
+        '''
+        A = A.type(self.dtype)
+        X = X.type(self.dtype)
+        # (N,N)@(b,T,N,d)->(b,T,N,d)->(b,T,N,d)
+        output = self.linear(torch.matmul(A, X))
+        return torch.sigmoid(output)
+
+
+class My_embedding(nn.Module):
+    '''
+    this is used to calculate the embedding of Spatial and time
+    '''
+
+    def __init__(self, T, N, d, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        super(My_embedding, self).__init__()
+        self.gcn = GCN(d, dtype=dtype)
+        self.dtype = dtype
+        self.T = T
+        self.d = d
+        self.N = N
+        self.device = device
+
+    def forward(self, X, A):
+        '''
+        this is used to return the embedding of the input
+        :param X: tensor(b,T,N,d),raw input
+        :param A: tensor(N,N),calculated by adaj,
+        :return embedding_X:tensor(b,T,N,d) the result of the embedding input (embedding with position embedding,spatial embedding)
+        '''
+        X = X.type(self.dtype)
+        A = A.type(self.dtype)
+        # (N,d)
+        Esp = generate_embedding_matrix(self.N, self.d, dtype=self.dtype).to(self.device)
+        # (T,d)
+        Etp = generate_embedding_matrix(self.T, self.d, dtype=self.dtype).to(self.device)
+        # (b,T,N,d)+(N,d)
+        sp_x = X + Esp.unsqueeze(dim=0).unsqueeze(dim=0)
+        # (b,T,N,d)
+        gcn_result = self.gcn(A, sp_x)
+        # (b,T,N,d)
+        tp_x = X + Esp.unsqueeze(dim=0).unsqueeze(dim=-2)
+
+        embedding_X = X + tp_x + sp_x
+
+        return embedding_X
+
+
+class SDGCN_with_ln_res(nn.Module):
+    '''
+    this is used to calculate the dynamic graph convolution
+    :param d,int,the size of the hidden dim
+    '''
+
+    def __init__(self, config:dict):
+        super(SDGCN_with_ln_res, self).__init__()
+        self.d=config['d']
+        self.dtype=config.setdefault('dtype',torch.float32)
+        self.ordinary_gcn = GCN(self.d, dtype=self.dtype)
+        self.ln = nn.LayerNorm(self.d, dtype=self.dtype)
+        self.A=config['A']
+
+    def forward(self,X):
+        '''
+
+        :param A:tensor(N,N),calculated from adja
+        :param X: tensor(b,T,N,d),the output of the last layer
+        :return: output,tensor(b,T,N,d),
+        '''
+        # (b,T,N,d)@(b,T,d,N)
+        St = torch.softmax(torch.matmul(X, X.permute(dims=(0, 1, 3, 2))), dim=-1) / math.sqrt(self.d + 1e-8)
+        output = self.ordinary_gcn(self.A * St, X)
+        output = output + X
+        return self.ln(output)
+
+
+class CausalConv(nn.Module):
+    '''
+    this is used to calculate the causal convolution which is to avoid the layers to use the future input
+    '''
+
+    def __init__(self, in_channels, out_channels, kernel_size=(1, 3), padding=(1, 1), stride=(1, 1),
+                 dtype=torch.float32):
+        super(CausalConv, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        # self.W=nn.Parameter(self.empty((self.out_channels,self.in_channels,*kernel_size) if len(kernel_size)==2 else (self.out_channels,self.in_channels,1,self.kernel_size),dtype=dtype))
+        # nn.init.xavier_uniform_(self.W)
+        self.conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.out_channels,
+                              kernel_size=self.kernel_size, stride=self.stride
+                              , padding=self.padding, dtype=dtype)
+        self.dtype = dtype
+
+    def forward(self, X):
+        '''
+        conv(input),input:(b,d,N,T)
+        :param X: tensor(b,T,N,d)
+        :return:
+        '''
+        b, T, N, d = X.shape
+        # kernel_size=self.kernel_size[-1] if len(self.kernel_size)==2 else self.kernel_size
+        # stride=self.stride[-1] if len(self.stride)==2 else self.stride
+        # #padding default equal,1D conv (kernel)(1,kernel_size)
+        # padding=self.padding[-1] if len(self.padding)==2 else self.padding
+        # Tout=(2*self.padding+T-kernel_size)//stride+1
+        # # N_next=()
+        # padding=self.padding
+        # HH,WW=self.kernel_size
+        # H,W=(N+2*padding[0]-HH)//self.stride[0],(T+2*padding[1]-WW)//self.stride[1]
+        # output=torch.zeros((b,self.out_channels,H,W),dtype=self.dtype)
+        # #(b,d,N,T)
+        # X=X.permute(dims=(0,-1,2,1))
+        # padded_x=F.pad(X,pad=(padding,padding),value=0)#在H,W方向进行padding
+        # calculate convolution,can use broadcast all,but maybe out of memory
+        # W(out_channels,in_channels,H,W),仅有沿着T的方向有mask,也就是需要考虑不能利用过去的结果
+        # for ba in range(b):     #批量
+        #     for c in range(self.out_channels):  #通道
+        #         for h in range(H):      #高
+        #             for w in range(W):      #宽
+        #                 output[ba,c,h,w]=output[ba,c,h,w]+torch.sum(X[ba,:,h*self.stride[0]:h*self.stride+HH,w*self.stride[1]:w*self.stride[1]+WW]*self.W).item()
+        # ok 本质上causal_convolution 与standard convolution 没什么大的区别，仅仅是进行了一定的平移,可以通过padding进行简单的结果变换
+        # 其实必须使用两个进行占位才能显示出来仅仅使用了之前的时间步，否则就是普通的卷积操作
+        X = X.type(self.dtype)
+        # (b,T,N,d)->(b,d,N,T)
+        X = X.permute(dims=(0, -1, 2, 1))
+        # (b,c,N,Tr)
+        output = self.conv(X)
+        output = F.pad(output, pad=(math.floor(self.kernel_size[-1] / 2), 0), value=0.)
+        # (b,T,N,d)
+        output = output.permute(dims=(0, -1, 2, 1))
+        return output
+
+
+class TrSelfAttention_with_ln_res(nn.Module):
+    '''
+    this is used to calculate the temporary trend aware self-attention,for each head
+    we will use the traditional convolution to calculate the attention
+
+    '''
+
+    # def __init__(self,d:int,n_head:int,q_norm_conv=False,k_norm_conv=False,dtype=torch.float32,kernel_size=(1,3),out_channels=64,padding=(1,1),stride=(1,1),mask=False):
+    def __init__(self, config:dict):
+        '''
+
+        :param config: dict('q_norm_conv','k_norm_conv',...)
+
+        '''
+        super(TrSelfAttention_with_ln_res, self).__init__()
+        # for key, value in kwargs.items():
+        #     setattr(self, key, value)
+        self.q_norm_conv=config.setdefault('q_norm_conv',False)
+        self.k_norm_conv=config.setdefault('k_norm_conv',False)
+        self.dtype=config.setdefault('dtype',torch.float32)
+        self.kernel_size=config.setdefault('kernel_size',(1,3))
+        self.out_channels=config.setdefault('out_channels',64)
+        self.padding=config.setdefault('padding',(1,1))
+        self.stride=config.setdefault('stride',(1,1))
+        self.mask=config.setdefault('mask',False)
+        self.d=config['d']
+        self.n_head=config['n_head']
+        self.dim_per_head = self.d // self.n_head
+        self.Wv = nn.Parameter(torch.empty((self.d, self.d), dtype=self.dtype))
+        # self.Wk=nn.Parameter(torch.empty((d,d),dtype=self.dtype))
+        # self.W=nn.Parameter(torch.empty((3,d,d),dtype=self.dtype))
+        self.Wo = nn.Parameter(torch.empty((self.d,self.d)))
+
+        if self.q_norm_conv:
+            # 使用ModuleList可以放置某些参数不会出现在self.parameters()中导致无法更新，为了保证最后的d_model 不变大小，实际上out_channels=d_model//self.n_head
+            self.conv_q_list = nn.ModuleList([nn.Conv2d(in_channels=self.dim_per_head, out_channels=self.out_channels,
+                                                        kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+                                              for i in range(self.n_head)])
+        else:
+            self.conv_k_list = nn.ModuleList([CausalConv(in_channels=self.dim_per_head, out_channels=self.out_channels,
+                                                         kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+                                              for i in range(self.n_head)])
+        if self.k_norm_conv:
+            self.conv_q_list = nn.ModuleList(
+                [nn.Conv2d(in_channels=self.dim_per_head, out_channels=self.out_channels, kernel_size=self.kernel_size \
+                           , stride=self.stride, padding=self.padding) for i in range(self.n_head)])
+        else:
+            self.conv_k_list = nn.ModuleList(
+                [CausalConv(in_channels=self.dim_per_head, out_channels=self.out_channels, kernel_size=self.kernel_size \
+                            , stride=self.stride, padding=self.padding) for i in range(self.n_head)])
+        self.ln = nn.LayerNorm(self.d)
+        for param in self.parameters():
+            if len(param.shape) >= 2:
+                torch.nn.init.xavier_uniform_(param)
+            else:
+                torch.nn.init.uniform_(param)
+
+    def forward(self, X):
+        '''
+        because this is self-attention ,so i don't need to input the query,key,v
+        :param X: tensor(b,N,T,d)
+        :return:output,tensor(b,N,T,d)
+        '''
+        b, N, T, d = X.shape
+        X = X.type(self.dtype)
+
+        # Q,K are all the X,in the paper ,they try to 保持input与output形状相同
+        trself_atten = torch.empty((self.n_head, b, T, N, d // self.n_head))
+        # (b,T,N,d)@(d,d)->(b,T,N,d)->(b,T,N,self.n_head,self.nun_per_head)->(n_head,b,T,N,num_per_head)
+        V = torch.matmul(X, self.Wv).reshape((b, N, T, self.n_head, -1)).permute(dims=(3, 0, 2, 1, 4))
+        # Q=torch.matmul(X,self.Wq)
+        # (b,T,N,d)->(b,T,N,n_head,num_per_head)->(n_head,b,T,N,num_per_head)
+        tempt_X = X.reshape((b, N, T, self.n_head, -1)).permute(dims=(3, 0, 1, 2, 4))
+        for i, conv in enumerate(zip(self.conv_q_list, self.conv_k_list)):
+            # X:(b,T,N,dim_per_head)->input:(b,num_per_head,N,T)
+            # conv(input)->(b,c,N,Tr)
+            trself_atten[i] = attention_with_dot_scale(conv[0](tempt_X[i]).permute(dims=(0, -1, 1, 2)),
+                                                       conv[1](tempt_X[i].permute(dims=(0, -1, 1, 2)), mask=self.mask),
+                                                       V[i])
+
+        # (n_head,b,Tr,N,num_per_head)->(b,Tr,N,dnext)
+        atten = trself_atten.permute(dims=(1, 2, 3, 0, 4)).flatten(start_dim=-2)
+        # (b,T,N,d)
+        atten = torch.matmul(atten, self.Wo)
+        output = atten + X
+        return self.ln(output)
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class MHSelfAttention_with_ln_res(nn.Module):
+    def __init__(self, d_model: int, n_head: int, dtype=torch.float32, device=device, mask=False):
+        super(MHSelfAttention_with_ln_res, self).__init__()
+        self.d_model = d_model
+        self.device = device
+        # 其实device是没必要的
+        self.ln = torch.nn.LayerNorm(self.d_model, device=device, dtype=dtype)
+        self.W_head = nn.Parameter(torch.empty((3, d_model, d_model), dtype=dtype))
+        self.W_out = nn.Parameter(torch.empty((d_model, d_model), dtype=dtype))
+        torch.nn.init.xavier_uniform_(self.W)
+        torch.nn.init.xavier_uniform_(self.W_out)
+        self.Wq, self.Wk, self.Wv = self.W_head
+        self.n_head = n_head
+        self.dtype = dtype
+        self.num_per_head = self.d_model // self.n_head
+        self.mask = mask
+
+    def forward(self, X):
+        '''
+        :param X:tensor,b,T,N,d_model
+        :return:b,T,N,d_model
+        '''
+        X = X.type(self.dtype)
+        b, T, N, d = X.shape
+        # (b,T,N,d)@(d,d*n_head)->(b,T,N,d*n_head)->(n_head,b,T,N,num_per_head)
+        Q = torch.matmul(X, self.Wq).view((b, T, N, self.num_per_head, -1)).permute(dims=(-1, 0, 1, 2, 3))
+        K = torch.matmul(X, self.Wk).view((b, T, N, self.num_per_head, -1)).permute(dims=(-1, 0, 1, 2, 3))
+        V = torch.matmul(X, self.Wv).view((b, T, N, self.num_per_head, -1)).permute(dims=(-1, 0, 1, 2, 3))
+        # (n_head,b,T,N,d)@(n_head,b,T,d,N)->(n_head,b,T,N,N)
+
+        a = torch.matmul(Q, K.permute(dims=(0, 1, 2, 4, 3)))
+        if self.mask:
+            mask = torch.ones((N, N), dtype=torch.bool)
+            mask = torch.triu(mask, diagonal=1)
+            a[mask[None, None, None, :, :]] = 1e-9
+        E = torch.softmax(a, dim=-1) / math.sqrt(d)
+        # (n_head,b,T,N,d)
+        output = torch.matmul(E, V)
+        # catcontate,->(b,T,N,d*n_head)
+        output = output.permute((1, 2, 3, 0, -1)).reshape(b, T, N, -1)
+        output = torch.matmul(output, self.W_out)
+        output = self.ln(X + output)
+        return output
+
+
+# design encoder
+'''
+config:dict
+configs:[config,config]
+'''
+
+
+class Encoder_layer(nn.Module):
+    def __init__(self, configs:dict):
+        super(Encoder_layer, self).__init__()
+        self.coder_layer = nn.Sequential(TrSelfAttention_with_ln_res(configs['TrSelf']), SDGCN_with_ln_res(configs['SDGCN']))
+
+    def forward(self, X):
+        '''
+
+        :param X:
+        :return:
+        '''
+
+        output = self.coder_layer(X)
+        return output
+
+# design decoder
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
